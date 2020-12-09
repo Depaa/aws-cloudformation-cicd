@@ -1,0 +1,693 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Create complete CI/CD using AWS CodeCommit, CodePipeline, CodeBuild and Slack notification",
+  "Parameters": {
+    "env": {
+      "Type": "String",
+      "Default": "develop",
+      "Description": "Environment",
+      "AllowedPattern": "develop|qas|prod"
+    },
+    "CodeCommitRepositoryName": {
+      "Type": "String",
+      "Default": "code-commit-name",
+      "Description": "Enter name of the new CodeCommit Repo."
+    },
+    "CodeCommitMainBranchName": {
+      "Type": "String",
+      "Default": "develop",
+      "Description": "Enter main branch name on your CodeCommit repository. Default is develop."
+    },
+    "CodeBuildProjectName": {
+      "Type": "String",
+      "Default": "code-build-name",
+      "Description": "Enter name of the new CodeBuild environment."
+    },
+    "CodePipelineName": {
+      "Type": "String",
+      "Default": "code-pipeline-name",
+      "Description": "Enter name of the new CodePipeline."
+    },
+    "CodePipelineArtifactS3BucketName": {
+      "Type": "String",
+      "Default": "code-pipeline-artifact-bucket",
+      "Description": "Enter name of the new Amazon S3 bucket to be created where artifacts for the pipeline are stored."
+    },
+    "SlackChannelWebhook": {
+      "Type": "String",
+      "Default": "services/XXX/XXX/XXX",
+      "Description": "Enter the slack webhook."
+    }
+  },
+  "Resources": {
+    "ArtifactS3Bucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Delete",
+      "Properties": {
+        "BucketName": { "Fn::Join": ["-", [{ "Ref": "CodePipelineArtifactS3BucketName" }, { "Ref": "env" }]] }
+      }
+    },
+    "ArtifactS3BucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "ArtifactS3Bucket"
+        },
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Sid": "DenyUnEncryptedObjectUploads",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":s3:::",
+                    {
+                      "Ref": "CodePipelineArtifactS3BucketName"
+                    },
+                    "-",
+                    {
+                      "Ref": "env"
+                    },
+                    "/*"
+                  ]
+                ]
+              },
+              "Condition": {
+                "StringNotEquals": {
+                  "s3:x-amz-server-side-encryption": {
+                    "Fn::Sub": "${AWS::Partition}:kms"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "DenyInsecureConnections",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":s3:::",
+                    {
+                      "Ref": "CodePipelineArtifactS3BucketName"
+                    },
+                    "-",
+                    {
+                      "Ref": "env"
+                    },
+                    "/*"
+                  ]
+                ]
+              },
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "CodeBuildProject": {
+      "Type": "AWS::CodeBuild::Project",
+      "DependsOn": ["CodeBuildServiceRole"],
+      "Properties": {
+        "Name": {
+          "Fn::Join": ["-", [{ "Ref": "CodeBuildProjectName" }, { "Ref": "env" }]]
+        },
+        "ServiceRole": {
+          "Ref": "CodeBuildServiceRole"
+        },
+        "Artifacts": {
+          "Type": "CODEPIPELINE"
+        },
+        "Environment": {
+          "Type": "LINUX_CONTAINER",
+          "ComputeType": "BUILD_GENERAL1_SMALL",
+          "Image": "aws/codebuild/standard:4.0",
+          "EnvironmentVariables": [
+            {
+              "Name": "ENV",
+              "Type": "PLAINTEXT",
+              "Value": { "Ref": "env" }
+            }
+          ]
+        },
+        "Source": {
+          "Type": "CODEPIPELINE"
+        },
+        "TimeoutInMinutes": 30
+      }
+    },
+    "CodePipeline": {
+      "Type": "AWS::CodePipeline::Pipeline",
+      "DependsOn": ["CodePipelineServiceRole", "CodeBuildProject"],
+      "Properties": {
+        "Name": { "Fn::Join": ["-", [{ "Ref": "CodePipelineName" }, { "Ref": "env" }]] },
+        "RoleArn": {
+          "Fn::GetAtt": ["CodePipelineServiceRole", "Arn"]
+        },
+        "Stages": [
+          {
+            "Name": "Source",
+            "Actions": [
+              {
+                "Name": "ApplicationSource",
+                "ActionTypeId": {
+                  "Version": "1",
+                  "Category": "Source",
+                  "Owner": "AWS",
+                  "Provider": "CodeCommit"
+                },
+                "OutputArtifacts": [
+                  {
+                    "Name": "SourceArtifacts"
+                  }
+                ],
+                "Configuration": {
+                  "RepositoryName": {
+                    "Ref": "CodeCommitRepositoryName"
+                  },
+                  "BranchName": {
+                    "Ref": "CodeCommitMainBranchName"
+                  },
+                  "PollForSourceChanges": false
+                },
+                "RunOrder": 1
+              }
+            ]
+          },
+          {
+            "Name": "Build",
+            "Actions": [
+              {
+                "Name": "ApplicationBuild",
+                "InputArtifacts": [
+                  {
+                    "Name": "SourceArtifacts"
+                  }
+                ],
+                "ActionTypeId": {
+                  "Category": "Build",
+                  "Owner": "AWS",
+                  "Version": "1",
+                  "Provider": "CodeBuild"
+                },
+                "OutputArtifacts": [
+                  {
+                    "Name": "OutputArtifacts"
+                  }
+                ],
+                "Configuration": {
+                  "ProjectName": {
+                    "Ref": "CodeBuildProject"
+                  }
+                },
+                "RunOrder": 2
+              }
+            ]
+          },
+          {
+            "Name": "Notification",
+            "Actions": [
+              {
+                "Name": "Slack",
+                "ActionTypeId": {
+                  "Category": "Invoke",
+                  "Owner": "AWS",
+                  "Provider": "Lambda",
+                  "Version": "1"
+                },
+                "Configuration": {
+                  "FunctionName": {
+                    "Ref": "SendSlackMessageFunction"
+                  }
+                },
+                "RunOrder": 3
+              }
+            ]
+          }
+        ],
+        "ArtifactStore": {
+          "Type": "S3",
+          "Location": { "Fn::Join": ["-", [{ "Ref": "CodePipelineArtifactS3BucketName" }, { "Ref": "env" }]] }
+        }
+      }
+    },
+    "CloudWatchEventRulePipeline": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": { "Fn::Join": ["-", [{ "Ref": "CodePipelineName" }, { "Ref": "env" }]] },
+        "EventPattern": {
+          "source": ["aws.codecommit"],
+          "detail-type": ["CodeCommit Repository State Change"],
+          "resources": [
+            {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":codecommit:",
+                  {
+                    "Ref": "AWS::Region"
+                  },
+                  ":",
+                  {
+                    "Ref": "AWS::AccountId"
+                  },
+                  ":",
+                  {
+                    "Ref": "CodeCommitRepositoryName"
+                  }
+                ]
+              ]
+            }
+          ],
+          "detail": {
+            "referenceType": ["branch"],
+            "referenceName": [
+              {
+                "Ref": "CodeCommitMainBranchName"
+              }
+            ],
+            "event": ["referenceCreated", "referenceUpdated"]
+          }
+        },
+        "Targets": [
+          {
+            "Arn": {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":codepipeline:",
+                  {
+                    "Ref": "AWS::Region"
+                  },
+                  ":",
+                  {
+                    "Ref": "AWS::AccountId"
+                  },
+                  ":",
+                  {
+                    "Ref": "CodePipelineName"
+                  },
+                  "-",
+                  {
+                    "Ref": "env"
+                  }
+                ]
+              ]
+            },
+            "RoleArn": {
+              "Fn::GetAtt": ["CodePipelineCWEventTriggerRole", "Arn"]
+            },
+            "Id": { "Fn::Join": ["-", [{ "Ref": "CodePipelineName" }, { "Ref": "env" }]] }
+          }
+        ]
+      }
+    },
+    "CodePipelineCWEventTriggerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["events.amazonaws.com"]
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": "cwe-pipeline-execution",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "codepipeline:StartPipelineExecution",
+                  "Resource": {
+                    "Fn::Join": [
+                      "",
+                      [
+                        "arn:aws:codepipeline:",
+                        {
+                          "Ref": "AWS::Region"
+                        },
+                        ":",
+                        {
+                          "Ref": "AWS::AccountId"
+                        },
+                        ":",
+                        {
+                          "Ref": "CodePipeline"
+                        }
+                      ]
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "CodePipelineServiceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["codepipeline.amazonaws.com"]
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": "aws-codepipeline-service",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "codecommit:CancelUploadArchive",
+                    "codecommit:GetBranch",
+                    "codecommit:GetCommit",
+                    "codecommit:GetUploadArchiveStatus",
+                    "codecommit:UploadArchive"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["codebuild:*"],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["lambda:InvokeFunction", "lambda:ListFunctions"],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["iam:PassRole"],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["autoscaling:*", "cloudwatch:*", "s3:*", "sns:*", "cloudformation:*", "sqs:*"],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "CodeBuildServiceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["codebuild.amazonaws.com"]
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": "aws-codebuild-service",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["*"],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "LambdaExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Join": [
+            "",
+            [
+              "SendSlackMessageFunctionRole",
+              "-",
+              {
+                "Ref": "env"
+              }
+            ]
+          ]
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["lambda.amazonaws.com"]
+              },
+              "Action": ["sts:AssumeRole"]
+            }
+          ]
+        }
+      }
+    },
+    "LambdaExecutionPolicy": {
+      "DependsOn": ["LambdaExecutionRole"],
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "lambda-execution-policy",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": {
+                "Fn::Sub": [
+                  "arn:aws:logs:${region}:${account}:log-group:/aws/lambda/${lambda}:log-stream:*",
+                  {
+                    "region": {
+                      "Ref": "AWS::Region"
+                    },
+                    "account": {
+                      "Ref": "AWS::AccountId"
+                    },
+                    "lambda": {
+                      "Ref": "SendSlackMessageFunction"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["codepipeline:PutJobSuccessResult", "codepipeline:PutJobFailureResult"],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+    "LambdaFunctionLogGroups": {
+      "Type": "AWS::Logs::LogGroup",
+      "DependsOn": "SendSlackMessageFunction",
+      "Properties": {
+        "RetentionInDays": 7,
+        "LogGroupName": {
+          "Fn::Join": [
+            "",
+            [
+              "/aws/lambda/",
+              {
+                "Ref": "SendSlackMessageFunction"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "SendSlackMessageFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Handler": "index.handler",
+        "FunctionName": {
+          "Fn::Join": [
+            "",
+            [
+              "send-slack-message",
+              "-",
+              {
+                "Ref": "env"
+              }
+            ]
+          ]
+        },
+        "Role": { "Fn::GetAtt": ["LambdaExecutionRole", "Arn"] },
+        "Code": {
+          "ZipFile": {
+            "Fn::Join": [
+              "\n",
+              [
+                "const https = require('https');",
+                "const AWS = require('aws-sdk');",
+                "const codepipeline = new AWS.CodePipeline();",
+                "exports.handler = async (event, context, callback) => {",
+                "  const jobId = event['CodePipeline.job'].id;",
+                "  const message = { text: `deploy succeeded in ${process.env.ENV} environment` };",
+                "  try {",
+                "    await sendNotification(JSON.stringify(message));",
+                "    const params = {",
+                "      jobId: jobId",
+                "    };",
+                "    await codepipeline.putJobSuccessResult(params).promise();",
+                "  } catch (e) {",
+                "    console.log('error putJobSuccessResult');",
+                "    console.log(e);",
+                "    const params = {",
+                "      jobId: jobId,",
+                "      failureDetails: {",
+                "        message: JSON.stringify(message),",
+                "        type: 'JobFailed',",
+                "        externalExecutionId: context.awsRequestId",
+                "      }",
+                "    };",
+                "    try {",
+                "      await codepipeline.putJobFailureResult(params).promise();",
+                "    } catch (e) {",
+                "      console.log('error putJobFailureResult');",
+                "      console.log(e);",
+                "      callback(null, {",
+                "        data: null,",
+                "        errorMessage: `Error sending job result`,",
+                "        errorType: 'ERROR'",
+                "      });",
+                "    }",
+                "  }",
+                "  callback(null, { data: jobId });",
+                "};",
+                "function sendNotification(message) {",
+                "  console.log('start sending message to slack');",
+                "  const options = {",
+                "    host: 'hooks.slack.com',",
+                "    path: `/${process.env.SLACK_WEBHOOK}`,",
+                "    method: 'POST',",
+                "    headers: {",
+                "      'Content-Type': 'application/json'",
+                "    }",
+                "  };",
+                "  return new Promise(function (resolve, reject) {",
+                "    const req = https.request(options, (res) => {",
+                "      var body = [];",
+                "      res.on('data', function (chunk) {",
+                "        body.push(chunk);",
+                "      });",
+                "      res.on('end', function () {",
+                "        try {",
+                "          body = Buffer.concat(body).toString();",
+                "        } catch (e) {",
+                "          console.log(e);",
+                "          reject(e);",
+                "        }",
+                "        resolve(body);",
+                "      });",
+                "    });",
+                "    req.on('error', (error) => {",
+                "      console.error(error);",
+                "      reject(error);",
+                "    });",
+                "    req.write(message);",
+                "    req.end();",
+                "  });",
+                "}"
+              ]
+            ]
+          }
+        },
+        "Runtime": "nodejs12.x",
+        "Timeout": "30",
+        "Environment": {
+          "Variables": {
+            "ENV": {
+              "Ref": "env"
+            },
+            "REGION": {
+              "Ref": "AWS::Region"
+            },
+            "SLACK_WEBHOOK": {
+              "Ref": "SlackChannelWebhook"
+            },
+            "AWS_NODEJS_CONNECTION_REUSE_ENABLED": 1
+          }
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "CodePipelineName": {
+      "Description": "My CI/CD Pipeline",
+      "Value": {
+        "Ref": "CodePipeline"
+      }
+    },
+    "CodeBuildName": {
+      "Description": "My CodeBuild Project",
+      "Value": {
+        "Ref": "CodeBuildProject"
+      }
+    }
+  }
+}
